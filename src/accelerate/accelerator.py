@@ -1559,8 +1559,9 @@ class Accelerator:
                     "You can't train a model that has been loaded in 8-bit or 4-bit precision with CPU or disk offload. "
                     "If you want train the 8-bit or 4-bit model in CPU, please install bitsandbytes with multi-backend, see https://huggingface.co/docs/bitsandbytes/main/en/installation#multi-backend"
                 )
-        elif device_placement and not self.verify_device_map(model):
-            model = model.to(self.device)
+        # fixme this branch is needed to be commented because it would cause whole model to npu
+        # elif device_placement and not self.verify_device_map(model):
+        #     model = model.to(self.device)
         if not evaluation_mode:
             if self.distributed_type in (
                 DistributedType.MULTI_GPU,
@@ -1582,11 +1583,19 @@ class Accelerator:
                     else:
                         device_ids, output_device = None, None
 
-                    model = torch.nn.parallel.DistributedDataParallel(
-                        model, device_ids=device_ids, output_device=output_device, **kwargs
-                    )
-                    if self.ddp_handler is not None:
-                        self.ddp_handler.register_comm_hook(model)
+                    # fixme replace DDP to HSDP temporarily
+                    # model = torch.nn.parallel.DistributedDataParallel(
+                    #     model, device_ids=device_ids, output_device=output_device, **kwargs
+                    # )
+                    # if self.ddp_handler is not None:
+                    #     self.ddp_handler.register_comm_hook(model)
+                    from hyper_parallel import hsdp
+                    for layer in model.visual.blocks:
+                        layer = hsdp(layer, optimizer_level="level3", threshold=0)
+                    for layer in model.language_model.layers:
+                        layer = hsdp(layer, optimizer_level="level3")
+                    model = hsdp(model, optimizer_level="level3").to(self.device)
+
             elif self.distributed_type == DistributedType.TP:
                 if not compare_versions("transformers", ">=", BETA_TP_AVAILABLE_TRANSFORMERS_VERSION):
                     raise ValueError(f"TP requires transformers >= {BETA_TP_AVAILABLE_TRANSFORMERS_VERSION}")
