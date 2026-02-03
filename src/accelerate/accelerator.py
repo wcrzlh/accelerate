@@ -1591,10 +1591,10 @@ class Accelerator:
                     #     self.ddp_handler.register_comm_hook(model)
                     from hyper_parallel import hsdp
                     for layer in model.visual.blocks:
-                        layer = hsdp(layer, optimizer_level="level3", threshold=0)
+                        layer = hsdp(layer, optimizer_level="level3", threshold=0, comm_async=True)
                     for layer in model.language_model.layers:
-                        layer = hsdp(layer, optimizer_level="level3")
-                    model = hsdp(model, optimizer_level="level3").to(self.device)
+                        layer = hsdp(layer, optimizer_level="level3", comm_async=True)
+                    model = hsdp(model, optimizer_level="level3", comm_async=True).to(self.device)
 
             elif self.distributed_type == DistributedType.TP:
                 if not compare_versions("transformers", ">=", BETA_TP_AVAILABLE_TRANSFORMERS_VERSION):
