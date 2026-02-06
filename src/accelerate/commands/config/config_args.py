@@ -194,6 +194,8 @@ class ClusterConfig(BaseConfig):
     deepspeed_config: Optional[dict] = None
     # args for fsdp
     fsdp_config: Optional[dict] = None
+    # args for hsdp
+    hsdp_config: Optional[dict] = None
     # args for parallelism config
     parallelism_config: Optional[dict] = None
     # args for megatron_lm

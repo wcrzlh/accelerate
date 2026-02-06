@@ -263,6 +263,12 @@ def launch_command_parser(subparsers=None):
         help="Whether to use fsdp.",
     )
     paradigm_args.add_argument(
+        "--use_hsdp",
+        default=False,
+        action="store_true",
+        help="Whether to use hsdp.",
+    )
+    paradigm_args.add_argument(
         "--use_parallelism_config",
         default=False,
         action="store_true",
@@ -608,6 +614,101 @@ def launch_command_parser(subparsers=None):
         default="false",
         type=str,
         help="Decides Whether (true|false) intermediate activations are freed during the forward pass, and a checkpoint is left as a placeholder. (useful only when `use_fsdp` flag is passed).",
+    )
+
+    # hsdp arguments
+    hsdp_args = parser.add_argument_group("HSDP Arguments", "Arguments related to Fully Shared Data Parallelism.")
+    hsdp_args.add_argument(
+        "--hsdp_version",
+        type=str,
+        default="2",
+        choices=["1", "2"],
+        help="HSDP version to use. (useful only when `use_hsdp` flag is passed).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_offload_params",
+        default="false",
+        type=str,
+        help="Decides Whether (true|false) to offload parameters and gradients to CPU. (useful only when `use_hsdp` flag is passed).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_min_num_params",
+        type=int,
+        default=1e8,
+        help="HSDP's minimum number of parameters for Default Auto Wrapping. (useful only when `use_hsdp` flag is passed).",
+    )
+    # We enable this for backwards compatibility, throw a warning if this is set in `FullyShardedDataParallelPlugin`
+    hsdp_args.add_argument(
+        "--hsdp_sharding_strategy",
+        type=str,
+        default="FULL_SHARD",
+        help="HSDP's sharding strategy. (useful only when `use_hsdp` flag is passed and `hsdp_version=1`).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_reshard_after_forward",
+        type=str,
+        default="true",
+        help="HSDP's Reshard After Forward Strategy. (useful only when `use_hsdp` flag is passed). Supports either boolean (HSDP2) or `FULL_SHARD | SHARD_GRAD_OP | NO_RESHARD` (HSDP1).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_auto_wrap_policy",
+        type=str,
+        default=None,
+        help="HSDP's auto wrap policy. (useful only when `use_hsdp` flag is passed).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_transformer_layer_cls_to_wrap",
+        default=None,
+        type=str,
+        help="Transformer layer class name (case-sensitive) to wrap ,e.g, `BertLayer`, `GPTJBlock`, `T5Block` .... "
+        "(useful only when `use_hsdp` flag is passed).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_backward_prefetch",
+        default=None,
+        type=str,
+        help="HSDP's backward prefetch policy. (useful only when `use_hsdp` flag is passed).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_state_dict_type",
+        default=None,
+        type=str,
+        help="HSDP's state dict type. (useful only when `use_hsdp` flag is passed).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_forward_prefetch",
+        default="false",
+        type=str,
+        help="If True, then HSDP explicitly prefetches the next upcoming "
+        "all-gather while executing in the forward pass (useful only when `use_hsdp` flag is passed).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_use_orig_params",
+        default="true",
+        type=str,
+        help="If True, allows non-uniform `requires_grad` during init, which means support for interspersed frozen and trainable parameters."
+        " (useful only when `use_hsdp` flag is passed).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_cpu_ram_efficient_loading",
+        default="true",
+        type=str,
+        help="If True, only the first process loads the pretrained model checkoint while all other processes have empty weights. "
+        "Only applicable for 🤗 Transformers. When using this, `--hsdp_sync_module_states` needs to True. "
+        "(useful only when `use_hsdp` flag is passed).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_sync_module_states",
+        default="true",
+        type=str,
+        help="If True, each individually wrapped HSDP unit will broadcast module parameters from rank 0."
+        " (useful only when `use_hsdp` flag is passed).",
+    )
+    hsdp_args.add_argument(
+        "--hsdp_activation_checkpointing",
+        default="false",
+        type=str,
+        help="Decides Whether (true|false) intermediate activations are freed during the forward pass, and a checkpoint is left as a placeholder. (useful only when `use_hsdp` flag is passed).",
     )
 
     # megatron_lm args
@@ -1025,15 +1126,15 @@ def sagemaker_launcher(sagemaker_config: SageMakerConfig, args):
 
 def _validate_launch_command(args):
     # Sanity checks
-    if sum([args.multi_gpu, args.cpu, args.tpu, args.use_deepspeed, args.use_fsdp]) > 1:
+    if sum([args.multi_gpu, args.cpu, args.tpu, args.use_deepspeed, args.use_fsdp, args.use_hsdp]) > 1:
         raise ValueError(
-            "You can only use one of `--cpu`, `--multi_gpu`, `--tpu`, `--use_deepspeed`, `--use_fsdp` at a time."
+            "You can only use one of `--cpu`, `--multi_gpu`, `--tpu`, `--use_deepspeed`, `--use_fsdp` , `--use_hsdp` at a time."
         )
     if args.multi_gpu and (args.num_processes is not None) and (args.num_processes < 2):
         raise ValueError("You need to use at least 2 processes to use `--multi_gpu`.")
 
-    if (not args.use_fsdp or args.fsdp_version == 1) and args.use_parallelism_config:
-        raise ValueError("You cannot use `--use_parallelism_config` without `--use_fsdp` and `--fsdp_version=2`. ")
+    if (not args.use_fsdp or args.fsdp_version == 1) and not args.use_hsdp and args.use_parallelism_config:
+        raise ValueError("You cannot use `--use_parallelism_config` without `--use_fsdp` and `--fsdp_version=2` or `--use_hsdp`. ")
 
     defaults = None
     warned = []
@@ -1047,6 +1148,7 @@ def _validate_launch_command(args):
             and not args.tpu_use_cluster
             and not args.use_deepspeed
             and not args.use_fsdp
+            and not args.use_hsdp
             and not args.use_megatron_lm
         ):
             args.use_deepspeed = defaults.distributed_type == DistributedType.DEEPSPEED
@@ -1066,6 +1168,7 @@ def _validate_launch_command(args):
             )
             args.tpu = defaults.distributed_type == DistributedType.XLA
             args.use_fsdp = defaults.distributed_type == DistributedType.FSDP
+            args.use_hsdp = defaults.distributed_type == DistributedType.HSDP
             args.use_megatron_lm = defaults.distributed_type == DistributedType.MEGATRON_LM
             args.tpu_use_cluster = defaults.tpu_use_cluster if args.tpu else False
             args.use_parallelism_config = defaults.parallelism_config != {}
@@ -1092,6 +1195,8 @@ def _validate_launch_command(args):
                     for key, value in attr.items():
                         if name == "fsdp_config" and not key.startswith("fsdp"):
                             key = "fsdp_" + key
+                        if name == "hsdp_config" and not key.startswith("hsdp"):
+                            key = "hsdp_" + key
                         elif name == "fp8_config" and not key.startswith("fp8"):
                             key = "fp8_" + key
                         if hasattr(args, "nondefault") and key not in args.nondefault:
@@ -1219,6 +1324,8 @@ def launch_command(args):
         args.deepspeed_fields_from_accelerate_config = ",".join(args.deepspeed_fields_from_accelerate_config)
         deepspeed_launcher(args)
     elif args.use_fsdp and not args.cpu:
+        multi_gpu_launcher(args)
+    elif args.use_hsdp and not args.cpu:
         multi_gpu_launcher(args)
     elif args.use_megatron_lm and not args.cpu:
         multi_gpu_launcher(args)

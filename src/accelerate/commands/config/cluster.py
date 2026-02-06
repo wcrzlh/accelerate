@@ -505,9 +505,120 @@ def get_cluster_input():
                 error_message="Please enter yes or no.",
             )
 
+    # hsdp config
+    hsdp_config = {}
+
+    if distributed_type in [
+        DistributedType.MULTI_GPU,
+        DistributedType.MULTI_NPU,
+        DistributedType.MULTI_MLU,
+        DistributedType.MULTI_SDAA,
+        DistributedType.MULTI_MUSA,
+        DistributedType.MULTI_XPU,
+        DistributedType.MULTI_HPU,
+    ]:
+        use_hsdp = _ask_field(
+            "Do you want to use HyperShardedDataParallel? [yes/NO]: ",
+            _convert_yes_no_to_bool,
+            default=False,
+            error_message="Please enter yes or no.",
+        )
+        if use_hsdp:
+            distributed_type = DistributedType.HSDP
+        if distributed_type == DistributedType.HSDP:
+            hsdp_config["hsdp_version"] = 2
+            hsdp_version = hsdp_config["hsdp_version"]  # extract to a variable to simplify usage later
+
+            hsdp_config["hsdp_reshard_after_forward"] = _ask_field(
+                "Do you want to enable resharding after forward? [YES/no]: ",
+                _convert_yes_no_to_bool,
+                default=True,
+                error_message="Please enter yes or no.",
+            )
+
+            hsdp_config["hsdp_offload_params"] = _ask_field(
+                "Do you want to offload parameters and gradients to CPU? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
+            )
+
+            hsdp_wrap_query = "What should be your auto wrap policy?"
+            hsdp_config["hsdp_auto_wrap_policy"] = _ask_options(
+                hsdp_wrap_query,
+                FSDP_AUTO_WRAP_POLICY,
+                lambda x: FSDP_AUTO_WRAP_POLICY[int(x)],
+            )
+            if hsdp_config["hsdp_auto_wrap_policy"] == FSDP_AUTO_WRAP_POLICY[0]:
+                use_no_split_modules = _ask_field(
+                    "Do you want to use the model's `_no_split_modules` to wrap. Only applicable for 🤗 Transformers [yes/NO]: ",
+                    _convert_yes_no_to_bool,
+                    default=False,
+                    error_message="Please enter yes or no.",
+                )
+                if not use_no_split_modules:
+                    hsdp_config["hsdp_transformer_layer_cls_to_wrap"] = _ask_field(
+                        "Specify the comma-separated list of transformer layer class names (case-sensitive) to wrap ,e.g, :"
+                        "`BertLayer`, `GPTJBlock`, `T5Block`, `BertLayer,BertEmbeddings,BertSelfOutput` ...? : ",
+                        str,
+                    )
+            elif hsdp_config["hsdp_auto_wrap_policy"] == FSDP_AUTO_WRAP_POLICY[1]:
+                hsdp_config["hsdp_min_num_params"] = _ask_field(
+                    "What should be your HSDP's minimum number of parameters for Default Auto Wrapping Policy? [1e8]: ",
+                    int,
+                    default=100000000,
+                )
+
+            hsdp_state_dict_type_query = "What should be your HSDP's state dict type?"
+            hsdp_config["hsdp_state_dict_type"] = _ask_options(
+                hsdp_state_dict_type_query,
+                FSDP_STATE_DICT_TYPE if hsdp_version == 1 else FSDP2_STATE_DICT_TYPE,
+                lambda x: FSDP_STATE_DICT_TYPE[int(x)] if hsdp_version == 1 else FSDP2_STATE_DICT_TYPE[int(x)],
+                default=0,
+            )
+            # Not implemented in FSDP2, ask for user input for FSDP1
+            # if hsdp_version == 1:
+            #     hsdp_config["hsdp_forward_prefetch"] = _ask_field(
+            #         "Do you want to enable FSDP's forward prefetch policy? [yes/NO]: ",
+            #         _convert_yes_no_to_bool,
+            #         default=False,
+            #         error_message="Please enter yes or no.",
+            #     )
+            # Obsolete in FSDP2, ask for user input for FSDP1
+            # if hsdp_version == 1:
+            #     hsdp_config["hsdp_use_orig_params"] = _ask_field(
+            #         "Do you want to enable FSDP's `use_orig_params` feature? [YES/no]: ",
+            #         _convert_yes_no_to_bool,
+            #         default=True,
+            #         error_message="Please enter yes or no.",
+            #     )
+            hsdp_config["hsdp_cpu_ram_efficient_loading"] = _ask_field(
+                "Do you want to enable CPU RAM efficient model loading? Only applicable for 🤗 Transformers models. [YES/no]: ",
+                _convert_yes_no_to_bool,
+                default=True,
+                error_message="Please enter yes or no.",
+            )
+            # Obsolete in FSDP2, ask for user input for FSDP1
+            # if hsdp_version == 1:
+            #     if hsdp_config["hsdp_cpu_ram_efficient_loading"]:
+            #         hsdp_config["hsdp_sync_module_states"] = True
+            #     else:
+            #         hsdp_config["hsdp_sync_module_states"] = _ask_field(
+            #             "Do you want each individually wrapped FSDP unit to broadcast module parameters from rank 0 at the start? [YES/no]: ",
+            #             _convert_yes_no_to_bool,
+            #             default=True,
+            #             error_message="Please enter yes or no.",
+            #         )
+            hsdp_config["hsdp_activation_checkpointing"] = _ask_field(
+                "Do you want to enable HSDP activation checkpointing? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
+            )
+
     parallelism_config = {}
 
-    if fsdp_config.get("fsdp_version", 1) == 2:
+    if fsdp_config.get("fsdp_version", 1) == 2 or hsdp_config.get("hsdp_version", 0):
         use_parallelism_config = _ask_field(
             "Do you want to use the parallelism config? [yes/NO]: ",
             _convert_yes_no_to_bool,
@@ -647,9 +758,9 @@ def get_cluster_input():
             default=1,
             error_message="Please enter an integer.",
         )
-    elif distributed_type in [DistributedType.FSDP, DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM]:
+    elif distributed_type in [DistributedType.FSDP, DistributedType.HSDP, DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM]:
         num_processes = _ask_field(
-            "How many GPU(s) should be used for distributed training? [1]:",
+            "How many NPU/GPU(s) should be used for distributed training? [1]:",
             int,
             default=1,
             error_message="Please enter an integer.",
@@ -896,6 +1007,7 @@ def get_cluster_input():
         fp8_config=fp8_config,
         deepspeed_config=deepspeed_config,
         fsdp_config=fsdp_config,
+        hsdp_config=hsdp_config,
         parallelism_config=parallelism_config,
         megatron_lm_config=megatron_lm_config,
         ipex_config=ipex_config,

@@ -888,6 +888,7 @@ class AcceleratorState:
         "deepspeed_plugin",
         "use_ipex",
         "fsdp_plugin",
+        "hsdp_plugin",
         "megatron_lm_plugin",
         "dynamo_plugin",
     ]
@@ -899,6 +900,7 @@ class AcceleratorState:
         dynamo_plugin=None,
         deepspeed_plugin=None,
         fsdp_plugin=None,
+        hsdp_plugin=None,
         torch_tp_plugin=None,
         megatron_lm_plugin=None,
         parallelism_config=None,
@@ -989,13 +991,14 @@ class AcceleratorState:
             ]:
                 # TODO: Siro - remove when axolotl fixes their side
                 if not os.environ.get("ACCELERATE_ALLOW_CP_STANDALONE", "false").lower() == "true":
-                    if self.parallelism_config and self.parallelism_config.cp_enabled and fsdp_plugin is None:
+                    if self.parallelism_config and self.parallelism_config.cp_enabled and fsdp_plugin is None and hsdp_plugin is None:
                         raise ValueError(
-                            "`cp_size > 1` specified in the `parallelism_config`, but no `fsdp_plugin` was provided. We need a `fsdp_plugin` to use context parallelism, as we also shard the model across the device mesh to save more memory"
+                            "`cp_size > 1` specified in the `parallelism_config`, but no `fsdp_plugin` or `hsdp_plugin` was provided. We need a `fsdp_plugin` to use context parallelism, as we also shard the model across the device mesh to save more memory"
                         )
                     if (
                         self.parallelism_config is not None
                         and self.parallelism_config.cp_enabled
+                        and fsdp_plugin is not None
                         and fsdp_plugin.fsdp_version == 1
                     ):
                         raise ValueError(
@@ -1008,6 +1011,15 @@ class AcceleratorState:
                     if self._mixed_precision != "no" and fsdp_plugin is not None:
                         fsdp_plugin.set_mixed_precision(self._mixed_precision)
                     self.fsdp_plugin = fsdp_plugin
+                # hsdp
+                if (os.environ.get("ACCELERATE_USE_HSDP", "false").lower() == "true" or hsdp_plugin is not None) or (
+                    self.parallelism_config is not None and self.parallelism_config.cp_enabled
+                ):
+                    self.distributed_type = DistributedType.HSDP
+                    if self._mixed_precision != "no" and hsdp_plugin is not None:
+                        hsdp_plugin.set_mixed_precision(self._mixed_precision)
+                    self.hsdp_plugin = hsdp_plugin
+
                 if os.environ.get(
                     "ACCELERATE_USE_MEGATRON_LM", "false"
                 ).lower() == "true" and self.distributed_type not in [
@@ -1102,6 +1114,10 @@ class AcceleratorState:
     @property
     def is_fsdp2(self) -> bool:
         return self.distributed_type == DistributedType.FSDP and self.fsdp_plugin.fsdp_version == 2
+
+    @property
+    def is_hsdp(self) -> bool:
+        return self.distributed_type == DistributedType.HSDP
 
     @property
     def is_last_process(self) -> bool:

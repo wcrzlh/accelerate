@@ -60,6 +60,7 @@ from .utils import (
     DynamoBackend,
     FP8RecipeKwargs,
     FullyShardedDataParallelPlugin,
+    HyperShardedDataParallelPlugin,
     GradientAccumulationPlugin,
     GradScalerKwargs,
     InitProcessGroupKwargs,
@@ -84,9 +85,12 @@ from .utils import (
     ensure_weights_retied,
     extract_model_from_parallel,
     fsdp2_apply_ac,
+    hsdp_apply_ac,
     fsdp2_canonicalize_names,
     fsdp2_prepare_model,
+    hsdp_prepare_model,
     fsdp2_switch_optimizer_parameters,
+    hsdp2_switch_optimizer_parameters,
     gather,
     gather_object,
     get_fsdp2_grad_scaler,
@@ -110,7 +114,9 @@ from .utils import (
     is_transformer_engine_available,
     is_xpu_available,
     load_fsdp_model,
+    load_hsdp_model,
     load_fsdp_optimizer,
+    load_hsdp_optimizer,
     model_has_dtensor,
     pad_across_processes,
     parse_choice_from_env,
@@ -119,7 +125,9 @@ from .utils import (
     release_memory,
     save,
     save_fsdp_model,
+    save_hsdp_model,
     save_fsdp_optimizer,
+    save_hsdp_optimizer,
     wait_for_everyone,
 )
 from .utils.constants import (
@@ -285,6 +293,7 @@ class Accelerator:
         dataloader_config: DataLoaderConfiguration | None = None,
         deepspeed_plugin: DeepSpeedPlugin | dict[str, DeepSpeedPlugin] | None = None,
         fsdp_plugin: FullyShardedDataParallelPlugin | None = None,
+        hsdp_plugin: HyperShardedDataParallelPlugin | None = None,
         torch_tp_plugin: TorchTensorParallelPlugin | None = None,  # Deprecate later, warning in `post_init`
         megatron_lm_plugin: MegatronLMPlugin | None = None,
         rng_types: list[str | RNGType] | None = None,
@@ -398,6 +407,28 @@ class Accelerator:
             if not is_torch_version(">=", FSDP2_PYTORCH_VERSION):
                 raise ImportError(f"FSDP2 requires PyTorch >= {FSDP2_PYTORCH_VERSION}")
 
+        # hsdp
+        # if os.environ.get("ACCELERATE_USE_FSDP", "false").lower() == "true" or isinstance(
+        #     hsdp_plugin, FullyShardedDataParallelPlugin
+        # ):
+        #     if not is_torch_version(">=", FSDP_PYTORCH_VERSION):
+        #         raise ValueError(f"FSDP requires PyTorch >= {FSDP_PYTORCH_VERSION}")
+
+        if hsdp_plugin is None:  # init from env variables
+            hsdp_plugin = (
+                HyperShardedDataParallelPlugin()
+                if os.environ.get("ACCELERATE_USE_HSDP", "false").lower() == "true"
+                else None
+            )
+        else:
+            if not isinstance(hsdp_plugin, HyperShardedDataParallelPlugin):
+                raise TypeError("`hsdp_plugin` must be a HyperShardedDataParallelPlugin object.")
+            os.environ["ACCELERATE_USE_HSDP"] = "true"  # use HSDP if plugin is provided
+
+        # if hsdp_plugin is not None and hsdp_plugin.hsdp_version == 2:
+        #     if not is_torch_version(">=", HSDP2_PYTORCH_VERSION):
+        #         raise ImportError(f"FSDP2 requires PyTorch >= {FSDP2_PYTORCH_VERSION}")
+
         if megatron_lm_plugin is None:  # init from env variables
             megatron_lm_plugin = (
                 MegatronLMPlugin() if os.environ.get("ACCELERATE_USE_MEGATRON_LM", "false").lower() == "true" else None
@@ -464,6 +495,7 @@ class Accelerator:
             dynamo_plugin=dynamo_plugin,
             deepspeed_plugin=deepspeed_plugins,
             fsdp_plugin=fsdp_plugin,
+            hsdp_plugin=hsdp_plugin,
             megatron_lm_plugin=megatron_lm_plugin,
             parallelism_config=parallelism_config,
             _from_accelerator=True,
@@ -749,6 +781,10 @@ class Accelerator:
     @property
     def is_fsdp2(self):
         return self.state.is_fsdp2
+
+    @property
+    def is_hsdp(self):
+        return self.state.is_hsdp
 
     @property
     def is_composable_parallelism_enabled(self):
@@ -1553,6 +1589,8 @@ class Accelerator:
             result = self._prepare_megatron_lm(*args)
         elif self.is_fsdp2:
             result = self._prepare_fsdp2(*args)
+        elif self.is_hsdp:
+            result = self._prepare_hsdp(*args)
         else:
             if self.fp8_backend == FP8BackendType.MSAMP:
                 args, device_placement = self._prepare_msamp(*args, device_placement=device_placement)
@@ -1701,6 +1739,80 @@ class Accelerator:
         for obj in result:
             if isinstance(obj, torch.optim.Optimizer):
                 fsdp2_switch_optimizer_parameters(obj, mapping)
+
+        return result
+
+    def _prepare_hsdp(self, *args):
+        # First pass: prepare everything except schedulers (and model, which is prepared separately below)
+        result = [
+            self._prepare_one(obj, first_pass=True) if not isinstance(obj, torch.nn.Module) else obj for obj in args
+        ]
+
+        # Second pass: prepare schedulers
+        result = [self._prepare_one(obj) if not isinstance(obj, torch.nn.Module) else obj for obj in result]
+
+        # Prepare the model
+        model_index, model = None, None
+        for i, obj in enumerate(result):
+            if isinstance(obj, torch.nn.Module):
+                model_index, model = i, obj
+
+        # Invariant: if we have a model, we also have an optimizer (checked in `prepare`)
+        if model_index is None:
+            return tuple(result)
+
+        # Needs to be done first, to make sure AC + fully_shard will work as expected
+        self.state.hsdp_plugin.set_auto_wrap_policy(model)
+
+        # Apply AC if needed
+        if self.state.hsdp_plugin.activation_checkpointing:
+            model = hsdp_apply_ac(self, model)
+
+        # Apply compile if needed, has to be *after* applying AC
+        # Copied from: `accelerator.prepare_model` ~ L1804
+        if self.state.dynamo_plugin.backend != DynamoBackend.NO and not is_compiled_module(model):
+            if self.state.dynamo_plugin.use_regional_compilation:
+                model = compile_regions(model, **self.state.dynamo_plugin.to_kwargs())
+            else:
+                model = torch.compile(model, **self.state.dynamo_plugin.to_kwargs())
+
+        # Get old params and canonicalize - we canonicalize to have the mapping easy
+        old_named_params = fsdp2_canonicalize_names(self._get_named_parameters(*tuple(result), drop_refs=True))
+
+        # Swap the optimizer parameters with empty, so `fully_shard` after will not allocate too much memory
+        from hyper_parallel import DTensor
+
+        for obj in result:
+            if isinstance(obj, torch.optim.Optimizer):
+                for param_group in obj.param_groups:
+                    for i, p in enumerate(param_group["params"]):
+                        # We drop a reference to the original param here, so that _move_states_to_device triggers a reallocation
+                        # We reassign the data_ptr to the original param, so that we preserve the mapping to the new ones
+                        param_group["params"][i] = torch.empty(1, dtype=p.dtype, device=p.device)
+                        param_group["params"][i].data_ptr = (
+                            p._local_tensor.data_ptr() if isinstance(p, DTensor) else p.data_ptr()
+                        )
+
+        self._models.append(model)
+
+        # Prepare everything FSDP2 related for the model (except AC)
+        model = hsdp_prepare_model(self, model)
+
+        # Remove the old model from the list
+        if len(self._models) > 1 and (self._models[-2] is self._models[-1]):
+            del self._models[-2]
+
+        # Replace the old model with the new one (shouldn't be needed as everything should be in place)
+        result[model_index] = model
+
+        # Get new params and canonicalize
+        new_named_params = fsdp2_canonicalize_names(self._get_named_parameters(*result))
+        # Build a map from old to new params
+        mapping = {p: new_named_params[n] for n, p in old_named_params.items()}
+        # Update the optimizer parameters
+        for obj in result:
+            if isinstance(obj, torch.optim.Optimizer):
+                hsdp2_switch_optimizer_parameters(obj, mapping)
 
         return result
 
@@ -2869,6 +2981,17 @@ class Accelerator:
                         return torch.nn.utils.clip_grad_norm_(
                             parameters, max_norm, norm_type=norm_type
                         )  # viz: https://github.com/pytorch/torchtitan/blob/main/docs/fsdp.md
+        if self.distributed_type == DistributedType.HSDP:
+            self.unscale_gradients()
+            parameters = [p for p in parameters]
+            for model in self._models:
+                if parameters == [p for p in model.parameters()]:
+                    if not self.is_hsdp:
+                        return model.clip_grad_norm_(max_norm, norm_type)
+                    else:
+                        return torch.nn.utils.clip_grad_norm_(
+                            parameters, max_norm, norm_type=norm_type
+                        )  # viz: https://github.com/pytorch/torchtitan/blob/main/docs/fsdp.md
         elif self.distributed_type == DistributedType.DEEPSPEED:
             # DeepSpeed handles gradient clipping internally, but we can retrieve the gradient norm
             if self.deepspeed_engine_wrapped is not None:
@@ -2918,8 +3041,8 @@ class Accelerator:
         ...     optimizer.step()
         ```
         """
-        if self.distributed_type in [DistributedType.DEEPSPEED, DistributedType.FSDP]:
-            raise Exception("DeepSpeed and FSDP  do not support `clip_grad_value_`. Use `clip_grad_norm_` instead.")
+        if self.distributed_type in [DistributedType.DEEPSPEED, DistributedType.FSDP, DistributedType.HSDP]:
+            raise Exception("DeepSpeed and FSDP and HSDP do not support `clip_grad_value_`. Use `clip_grad_norm_` instead.")
         self.unscale_gradients()
         torch.nn.utils.clip_grad_value_(parameters, clip_value)
 
@@ -3542,6 +3665,10 @@ class Accelerator:
                 logger.info("Saving FSDP model")
                 save_fsdp_model(self.state.fsdp_plugin, self, model, output_dir, i)
                 logger.info(f"FSDP Model saved to output dir {output_dir}")
+            if self.distributed_type == DistributedType.HSDP:
+                logger.info("Saving HSDP model")
+                save_hsdp_model(self.state.hsdp_plugin, self, model, output_dir, i)
+                logger.info(f"HSDP Model saved to output dir {output_dir}")
             elif self.distributed_type == DistributedType.DEEPSPEED:
                 logger.info("Saving DeepSpeed Model and Optimizer")
                 ckpt_id = f"{MODEL_NAME}" if i == 0 else f"{MODEL_NAME}_{i}"
@@ -3561,6 +3688,11 @@ class Accelerator:
                 logger.info("Saving FSDP Optimizer")
                 save_fsdp_optimizer(self.state.fsdp_plugin, self, opt, self._models[i], output_dir, i)
                 logger.info(f"FSDP Optimizer saved to output dir {output_dir}")
+        elif self.distributed_type == DistributedType.HSDP:
+            for i, opt in enumerate(self._optimizers):
+                logger.info("Saving HSDP Optimizer")
+                save_hsdp_optimizer(self.state.hsdp_plugin, self, opt, self._models[i], output_dir, i)
+                logger.info(f"HSDP Optimizer saved to output dir {output_dir}")
         elif self.distributed_type not in [DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM]:
             optimizers = self._optimizers
 
@@ -3690,6 +3822,10 @@ class Accelerator:
                 logger.info("Loading FSDP model")
                 load_fsdp_model(self.state.fsdp_plugin, self, model, input_dir, i)
                 logger.info(f"FSDP Model loaded from input dir {input_dir}")
+            elif self.distributed_type == DistributedType.HSDP:
+                logger.info("Loading HSDP model")
+                load_hsdp_model(self.state.hsdp_plugin, self, model, input_dir, i)
+                logger.info(f"HSDP Model loaded from input dir {input_dir}")
             elif self.distributed_type == DistributedType.DEEPSPEED:
                 logger.info("Loading DeepSpeed Model and Optimizer")
                 ckpt_id = f"{MODEL_NAME}" if i == 0 else f"{MODEL_NAME}_{i}"
@@ -3724,6 +3860,11 @@ class Accelerator:
                 logger.info("Loading FSDP Optimizer")
                 load_fsdp_optimizer(self.state.fsdp_plugin, self, opt, self._models[i], input_dir, i)
                 logger.info(f"FSDP Optimizer loaded from input dir {input_dir}")
+        elif self.distributed_type == DistributedType.HSDP:
+            for i, opt in enumerate(self._optimizers):
+                logger.info("Loading HSDP Optimizer")
+                load_hsdp_optimizer(self.state.hsdp_plugin, self, opt, self._models[i], input_dir, i)
+                logger.info(f"HSDP Optimizer loaded from input dir {input_dir}")
         elif self.distributed_type not in [DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM]:
             optimizers = self._optimizers
 
@@ -3931,6 +4072,11 @@ class Accelerator:
 
                 state_dict = clone_tensors_for_torch_save(self.unwrap_model(model).state_dict())
         elif self.is_fsdp2:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+            options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, cpu_offload=True)
+            state_dict = get_model_state_dict(model, options=options)
+        elif self.is_hsdp:
             from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
             options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, cpu_offload=True)

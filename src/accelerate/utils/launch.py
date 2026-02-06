@@ -331,6 +331,36 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
         if getattr(args, "fsdp_ignored_modules", None) is not None:
             current_env["FSDP_IGNORED_MODULES"] = str(args.fsdp_ignored_modules)
 
+    if args.use_hsdp:
+        current_env["ACCELERATE_USE_HSDP"] = "true"
+        if args.hsdp_cpu_ram_efficient_loading and not args.hsdp_sync_module_states:
+            raise ValueError("When using `--hsdp_cpu_ram_efficient_loading` set `--hsdp_sync_module_states` to `True`")
+
+        current_env["HSDP_VERSION"] = str(args.hsdp_version) if hasattr(args, "hsdp_version") else "1"
+
+        # For backwards compatibility, we support this in launched scripts,
+        # however, we do not ask users for this in `accelerate config` CLI
+        current_env["HSDP_SHARDING_STRATEGY"] = str(args.hsdp_sharding_strategy)
+
+        current_env["HSDP_RESHARD_AFTER_FORWARD"] = str(args.hsdp_reshard_after_forward).lower()
+        current_env["HSDP_OFFLOAD_PARAMS"] = str(args.hsdp_offload_params).lower()
+        current_env["HSDP_MIN_NUM_PARAMS"] = str(args.hsdp_min_num_params)
+        if args.hsdp_auto_wrap_policy is not None:
+            current_env["HSDP_AUTO_WRAP_POLICY"] = str(args.hsdp_auto_wrap_policy)
+        if args.hsdp_transformer_layer_cls_to_wrap is not None:
+            current_env["HSDP_TRANSFORMER_CLS_TO_WRAP"] = str(args.hsdp_transformer_layer_cls_to_wrap)
+        if args.hsdp_backward_prefetch is not None:
+            current_env["HSDP_BACKWARD_PREFETCH"] = str(args.hsdp_backward_prefetch)
+        if args.hsdp_state_dict_type is not None:
+            current_env["HSDP_STATE_DICT_TYPE"] = str(args.hsdp_state_dict_type)
+        current_env["HSDP_FORWARD_PREFETCH"] = str(args.hsdp_forward_prefetch).lower()
+        current_env["HSDP_USE_ORIG_PARAMS"] = str(args.hsdp_use_orig_params).lower()
+        current_env["HSDP_CPU_RAM_EFFICIENT_LOADING"] = str(args.hsdp_cpu_ram_efficient_loading).lower()
+        current_env["HSDP_SYNC_MODULE_STATES"] = str(args.hsdp_sync_module_states).lower()
+        current_env["HSDP_ACTIVATION_CHECKPOINTING"] = str(args.hsdp_activation_checkpointing).lower()
+        if getattr(args, "hsdp_ignored_modules", None) is not None:
+            current_env["HSDP_IGNORED_MODULES"] = str(args.hsdp_ignored_modules)
+
     if args.use_megatron_lm:
         prefix = "MEGATRON_LM_"
         current_env["ACCELERATE_USE_MEGATRON_LM"] = "true"
